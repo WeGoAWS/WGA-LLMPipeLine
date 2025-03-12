@@ -78,7 +78,7 @@ def get_cloudtrail_logs(bucket_name, file_key):# CloudTrail 로그 가져오기
         logs = json.loads(gz.read().decode("utf-8"))
     return logs
 
-def get_latest_events(logs, count=5):# CloudTrail 로그에서 최신 이벤트 가져오기
+def get_latest_events(logs, count):# CloudTrail 로그에서 최신 이벤트 가져오기
     return logs.get("Records", [])[:count]
 
 
@@ -114,9 +114,9 @@ def get_user_permissions(user_arn):
 
         inline_policies = iam_client.list_user_policies(UserName=user_name).get("PolicyNames", [])# Inline Policies 가져오기
         for policy_name in inline_policies:
-            policy_document = iam_client.get_user_policy(UserName=user_name, PolicyName=policy_name)["PolicyDocument"]
-            for statement in policy_document.get("Statement", []):
-                if "Action" in statement:
+            policy_document = iam_client.get_user_policy(UserName=user_name, PolicyName=policy_name)["PolicyDocument"]# Policy 문서 가져오기
+            for statement in policy_document.get("Statement", []):#
+                if "Action" in statement: 
                     actions = statement["Action"]
                     if isinstance(actions, str):
                         permissions.add(actions)
@@ -146,16 +146,16 @@ def analyze_policy_with_bedrock(log, user_arn):
         })
         response_text = response.content
     
-        result = {"REMOVE": [], "ADD": [], "Reason": ""}
-        for line in response_text.strip().split("\n"):
-            if line.startswith("REMOVE:"):
-                perms = line.replace("REMOVE:", "").strip()
-                if perms != "None":
-                    result["REMOVE"].append(perms)
-            elif line.startswith("ADD:"):
-                perms = line.replace("ADD:", "").strip()
-                if perms != "None":
-                    result["ADD"].append(perms)
+        result = {"REMOVE": [], "ADD": [], "Reason": ""}# 결과 초기화
+        for line in response_text.strip().split("\n"):# 결과 파싱
+            if line.startswith("REMOVE:"):# REMOVE:으로 시작하는 경우
+                perms = line.replace("REMOVE:", "").strip()# 권한 가져오기
+                if perms != "None": 
+                    result["REMOVE"].append(perms)# 결과에 추가
+            elif line.startswith("ADD:"):# ADD:으로 시작하는 경우
+                perms = line.replace("ADD:", "").strip()# 권한 가져오기
+                if perms != "None": 
+                    result["ADD"].append(perms)# 결과에 추가
             elif line.startswith("Reason:"):
                 result["Reason"] = line.replace("Reason:", "").strip()
         return result
@@ -163,8 +163,8 @@ def analyze_policy_with_bedrock(log, user_arn):
         print(f"Error in policy analysis: {e}")
         return {"REMOVE": [], "ADD": [], "Reason": "Policy analysis failed."}
 
-### **📌 4️⃣ 결과 저장 및 실행**
-def save_analysis_to_s3(bucket_name, file_key, analysis_results):
+
+def save_analysis_to_s3(bucket_name, file_key, analysis_results):# 분석 결과를 S3에 저장
     s3_client.put_object(
         Bucket=bucket_name,
         Key=file_key,
@@ -173,14 +173,14 @@ def save_analysis_to_s3(bucket_name, file_key, analysis_results):
     )
 
 def process_logs(bucket_name, log_prefix, output_bucket_name, output_file_key):# 
-    print(f"Finding latest CloudTrail log from S3: {bucket_name}/{log_prefix}")
+    print(f"Finding latest CloudTrail log from S3: {bucket_name}/{log_prefix}") 
     latest_file_key = find_latest_cloudtrail_file(bucket_name, log_prefix)
 
-    print(f"Fetching logs from S3: {bucket_name}/{latest_file_key}")
+    print(f"Fetching logs from S3: {bucket_name}/{latest_file_key}")#
     logs = get_cloudtrail_logs(bucket_name, latest_file_key)
-
-    print("Fetching latest 5 events from CloudTrail logs...")
-    latest_events = get_latest_events(logs, count=5)
+    count = 10# 최신 count개의 이벤트만 가져옴
+    print(f"Fetching latest {count} events from CloudTrail logs...")
+    latest_events = get_latest_events(logs, count)
 
     print("Analyzing logs and recommending IAM policies...")
     analysis_results = []
@@ -199,4 +199,4 @@ def process_logs(bucket_name, log_prefix, output_bucket_name, output_file_key):#
     print("Saving analysis results to S3...")
     save_analysis_to_s3(output_bucket_name, output_file_key, analysis_results)
 
-process_logs("aws-cloudtrail-logs-863518424796-24295883", "AWSLogs/", "aws-cloudtrail-log-comment", "test_result.json")
+process_logs("aws-cloudtrail-logs-863518424796-24295883", "AWSLogs/", "aws-cloudtrail-log-comment", "test_result.json")#전체 파이프라인 실행
