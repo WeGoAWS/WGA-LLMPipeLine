@@ -139,7 +139,7 @@ def get_user_permissions(user_arn):
 
 
 def retry_with_backoff(func, max_retries=8, base_delay=1.5):
-    """지수적 백오프(Exponential Backoff)를 사용하여 요청을 재시도하는 함수"""
+     
     retries = 0
     while retries < max_retries:
         try:
@@ -170,7 +170,7 @@ def analyze_policy_with_bedrock(log, user_arn):
             "log_event": json.dumps(log, indent=4),
             "current_permissions": json.dumps(current_permissions, indent=4)
         }))
-        response_text = response.content  # AIMessage에서 .content 가져오기
+        response_text = response.content  
     
         result = {"REMOVE": [], "ADD": [], "Reason": ""}
         for line in response_text.strip().split("\n"):
