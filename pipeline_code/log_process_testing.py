@@ -59,21 +59,26 @@ policy_analysis_chain = policy_prompt | ollama_llm
 
 def analyze_log(log):
     try:
+        print(f"[INFO] Analyzing log event: {log.get('eventName', 'Unknown Event')} at {log.get('eventTime', 'Unknown Time')}...")
         response = log_analysis_chain.invoke({"log_event": json.dumps(log, indent=4)})
+        print("[SUCCESS] Log analysis complete.")
         return response.content
     except Exception as e:
-        print(f"Error in LLM analysis: {e}")
+        print(f"[ERROR] Error in LLM analysis: {e}")
         return "Analysis failed."
 
 def analyze_policy(log, user_arn):
     try:
+        print(f"[INFO] Analyzing IAM policy for user: {user_arn}...")
         current_permissions = []  #일단 비워놨음
         response = policy_analysis_chain.invoke({
             "log_event": json.dumps(log, indent=4),
             "current_permissions": json.dumps(current_permissions, indent=4)
         })
+        print("[SUCCESS] IAM policy analysis complete.")
         response_text = response.content
         result = {"REMOVE": [], "ADD": [], "Reason": ""}
+
         for line in response_text.strip().split("\n"):
             if line.startswith("REMOVE:"):
                 perms = line.replace("REMOVE:", "").strip()
@@ -85,28 +90,31 @@ def analyze_policy(log, user_arn):
                     result["ADD"].append(perms)
             elif line.startswith("Reason:"):
                 result["Reason"] = line.replace("Reason:", "").strip()
+
         return result
     except Exception as e:
-        print(f"Error in policy analysis: {e}")
+        print(f"[ERROR] Error in policy analysis: {e}")
         return {"REMOVE": [], "ADD": [], "Reason": "Policy analysis failed."}
 
 def process_local_logs(local_file, output_file, event_count=5):
+    print(f"[INFO] Loading local logs from {local_file}...")
     with open(local_file, "r") as f:
         data = json.load(f)
     
-    if isinstance(data, list):#리스트면 그대로
+    if isinstance(data, list):  # 리스트면 그대로
         records = data
-    elif isinstance(data, dict) and "Records" in data:#딕셔너리면 Records 키값에 있는 값
+    elif isinstance(data, dict) and "Records" in data:  # 딕셔너리면 Records 키값에 있는 값
         records = data["Records"]
     else:
-        print("No valid log records found.")
+        print("[ERROR] No valid log records found.")
         return
 
-    records.sort(key=lambda x: x.get("eventTime", ""), reverse=True)#시간순으로 정렬
+    records.sort(key=lambda x: x.get("eventTime", ""), reverse=True)  # 시간순으로 정렬
     latest_events = records[:event_count]
 
     analysis_results = []
-    for log in latest_events:
+    for idx, log in enumerate(latest_events, start=1):
+        print(f"\n[PROCESSING] ({idx}/{event_count}) Processing log event...")
         user_arn = log.get("userIdentity", {}).get("arn", "unknown")
         security_analysis = analyze_log(log)
         policy_recommendation = analyze_policy(log, user_arn)
@@ -116,16 +124,18 @@ def process_local_logs(local_file, output_file, event_count=5):
             "analysis_comment": security_analysis,
             "policy_recommendation": policy_recommendation
         })
-    
+        print(f"({idx}/{event_count}) Log event processed.\n")
+
     with open(output_file, "w") as f:
         json.dump(analysis_results, f, indent=4)
     
-    print("Local log analysis complete. Results saved to:", output_file)
+    print(f"log analysis complete. Results saved to: {output_file}")
 
 def main():
     num = 1
     local_file = f"flaws_cloudtrail00_split/part_{num}.json"
     output_file = f"output/local_result_{num}.json"
     process_local_logs(local_file, output_file, event_count=10)
+
 if __name__ == "__main__":
     main()
