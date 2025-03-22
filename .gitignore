@@ -171,3 +171,4 @@ cython_debug/
 .pypirc
 
 flaws_cloudtrail00_split/*
+cloudtrail_logs_json/*
