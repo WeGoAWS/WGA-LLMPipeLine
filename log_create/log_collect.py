@@ -23,16 +23,13 @@ REGIONS = [
 START_DATE = '2025-03-20T00:00:00'
 END_DATE = '2025-03-23T00:00:00'
 OUTPUT_DIR = './cloudtrail_logs_json'
-
-# 날짜 파싱
 start_dt = datetime.fromisoformat(START_DATE).astimezone(tz.UTC)
 end_dt = datetime.fromisoformat(END_DATE).astimezone(tz.UTC)
+date_list = [start_dt + timedelta(days=i) for i in range((end_dt - start_dt).days + 1)]
 
-# boto3 클라이언트
 s3 = boto3.client('s3')
 
-# 날짜 리스트 생성
-date_list = [start_dt + timedelta(days=i) for i in range((end_dt - start_dt).days + 1)]
+
 
 # 로그 키 수집
 log_keys = []
@@ -70,7 +67,7 @@ print(f"수집된 로그 파일 수: {len(log_keys)}개")
 # 로그 디렉토리 생성
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# 로그 수집 및 압축 해제 (진행률 표시)
+# 로그 수집 및 압축 해제
 all_events = []
 for key in tqdm(log_keys, desc="처리 중", unit="파일"):
     obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
