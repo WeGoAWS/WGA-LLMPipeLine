@@ -2,6 +2,8 @@ import json
 import gzip
 import boto3
 import botocore.exceptions
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
@@ -11,51 +13,70 @@ from langchain_ollama import ChatOllama
 s3_client = boto3.client("s3")
 iam_client = boto3.client("iam")
 
-# LangChain 메모리 (대화 기록 저장용)
+# LangChain 메모리
 memory = ConversationBufferMemory(memory_key="chat_history", input_key="log_event")
 
 # CloudTrail 로그 분석 프롬프트
 log_analysis_prompt = PromptTemplate(
     input_variables=["log_event"],
     template="""
-    Human: Analyze the following AWS CloudTrail log and determine if there are any security risks.
+You are a cloud security analyst reviewing AWS CloudTrail logs.
 
-    Log Data:
-    {log_event}
+Analyze the following AWS CloudTrail log event and answer the following questions in detail:
 
-    - Identify potential security risks.
-    - Clearly explain the risk level (Low, Medium, High).
-    - Provide recommendations if needed.
-    - Indicate if this event is normal or suspicious.
-    - Provide a summary of the event in a short, human-readable format.
+Log Event:
+{log_event}
 
-    Assistant:
-    """
+1. Is this event indicative of any known security risks or misconfigurations?
+2. Classify the event as:
+   - Normal activity
+   - Suspicious activity
+   - Malicious activity
+3. Rate the severity of the risk (None, Low, Medium, High).
+4. Explain why this risk level was assigned based on:
+   - The action performed
+   - The resource involved
+   - The user identity type (IAM user, role, root)
+   - Whether MFA was used
+   - Source IP or user agent anomaly
+5. Recommend any of the following, if applicable:
+   - IAM permission tightening
+   - Policy change
+   - Monitoring or alerting
+   - No action required
+6. Finally, summarize the event in **one short, human-readable sentence**.
+
+Respond in clearly labeled sections.
+"""
 )
 
 # IAM 정책 분석 프롬프트
 policy_prompt = PromptTemplate(
     input_variables=["log_event", "current_permissions"],
     template="""
-    Human: Based on the following CloudTrail log and the user's current permissions, recommend IAM policy modifications.
+You are a cloud IAM policy expert. Based on the CloudTrail log and the user's current IAM permissions, analyze and recommend policy adjustments.
 
-    CloudTrail Log:
-    {log_event}
+CloudTrail Log:
+{log_event}
 
-    Current Permissions:
-    {current_permissions}
+Current Permissions:
+{current_permissions}
 
-    - Only remove permissions if they are **clearly unnecessary** based on the log.
-    - If a permission has been used multiple times, do not remove it.
-    - If additional permissions are needed, provide them.
-    - If the log suggests a need for more restrictive permissions, recommend policy adjustments.
-    - Provide a reason for each change.
+1. Are there any permissions that were not used in this log and appear unnecessary?
+2. Are there any actions in the log that were blocked or would fail due to missing permissions?
+3. Based on the user's activity, should any permissions be added or removed?
 
-    Format your response exactly as:
-    REMOVE: <permissions or None>
-    ADD: <permissions or None>
-    Reason: <Clear explanation in one sentence.>
-    """
+When modifying permissions:
+- DO NOT remove permissions that were used multiple times across logs.
+- DO NOT remove permissions that might cause service disruption.
+- ONLY add permissions if they are required for observed activity.
+
+Respond in the format below:
+
+REMOVE: <list of permissions to remove or None>
+ADD: <list of permissions to add or None>
+Reason: <One-line rationale that justifies the change>
+"""
 )
 
 # LangChain 실행 파이프라인 구성  
@@ -63,6 +84,14 @@ ollama_model = "deepseek-r1:7b"
 ollama_llm = ChatOllama(model=ollama_model)
 log_analysis_chain = log_analysis_prompt | ollama_llm
 policy_analysis_chain = policy_prompt | ollama_llm
+# 민감한 이벤트 목록
+SENSITIVE_EVENTS = {
+    "ConsoleLogin", "PutUserPolicy", "AttachUserPolicy",
+    "CreateAccessKey", "UpdateAssumeRolePolicy"
+}
+
+def is_sensitive_event(event_name):
+    return event_name in SENSITIVE_EVENTS
 
 def find_latest_cloudtrail_files(bucket_name, prefix, file_count):
     response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
@@ -78,11 +107,6 @@ def get_cloudtrail_logs(bucket_name, file_key):
     with gzip.GzipFile(fileobj=response["Body"]) as gz:
         logs = json.loads(gz.read().decode("utf-8"))
     return logs
-
-def get_latest_events(logs, count):
-    records = logs.get("Records", [])
-    records.sort(key=lambda x: x.get("eventTime", ""), reverse=True)
-    return records[:count]
 
 def get_user_permissions(user_arn):
     if user_arn.endswith(":root"):
@@ -158,6 +182,32 @@ def analyze_policy(log, user_arn):
         print(f"Error in policy analysis: {e}")
         return {"REMOVE": [], "ADD": [], "Reason": "Policy analysis failed."}
 
+def analyze_policy_multiple(logs, user_arn):
+    try:
+        current_permissions = get_user_permissions(user_arn)
+        all_logs_text = "\n\n".join([json.dumps(log, indent=4) for log in logs])
+        response = policy_analysis_chain.invoke({
+            "log_event": all_logs_text,
+            "current_permissions": json.dumps(current_permissions, indent=4)
+        })
+        response_text = response.content
+        result = {"REMOVE": [], "ADD": [], "Reason": ""}
+        for line in response_text.strip().split("\n"):
+            if line.startswith("REMOVE:"):
+                perms = line.replace("REMOVE:", "").strip()
+                if perms != "None":
+                    result["REMOVE"].append(perms)
+            elif line.startswith("ADD:"):
+                perms = line.replace("ADD:", "").strip()
+                if perms != "None":
+                    result["ADD"].append(perms)
+            elif line.startswith("Reason:"):
+                result["Reason"] = line.replace("Reason:", "").strip()
+        return result
+    except Exception as e:
+        print(f"Error in policy analysis: {e}")
+        return {"REMOVE": [], "ADD": [], "Reason": "Policy analysis failed."}
+
 def save_analysis_to_s3(bucket_name, file_key, analysis_results):
     s3_client.put_object(
         Bucket=bucket_name,
@@ -166,34 +216,86 @@ def save_analysis_to_s3(bucket_name, file_key, analysis_results):
         ContentType="application/json"
     )
 
-def process_aws_logs(aws_bucket_name, aws_log_prefix, output_bucket_name, output_file_key, file_count=5, event_count=5):
+def process_combined_aws_logs(aws_bucket_name, aws_log_prefix, output_bucket_name, output_file_key, file_count=10, min_log_per_user=3):
+    now = datetime.now(timezone.utc)
+    one_day_ago = now - timedelta(days=1)
+
     all_logs = []
     aws_file_keys = find_latest_cloudtrail_files(aws_bucket_name, aws_log_prefix, file_count)
+
     for file_key in aws_file_keys:
         logs = get_cloudtrail_logs(aws_bucket_name, file_key)
-        all_logs.extend(logs.get("Records", []))
-    all_logs.sort(key=lambda x: x.get("eventTime", ""), reverse=True)
-    latest_events = all_logs[:event_count]
-    analysis_results = []
-    for log in latest_events:
+        for record in logs.get("Records", []):
+            try:
+                event_time = datetime.strptime(record.get("eventTime", ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                if one_day_ago <= event_time <= now:
+                    all_logs.append(record)
+            except Exception as e:
+                print(f"Invalid eventTime in log: {e}")
+
+    user_logs = defaultdict(list)
+    sensitive_logs = []
+
+    for log in all_logs:
         user_arn = log.get("userIdentity", {}).get("arn", "unknown")
-        security_analysis = analyze_log(log)
-        policy_recommendation = analyze_policy(log, user_arn)
+        user_logs[user_arn].append(log)
+        if is_sensitive_event(log.get("eventName", "")):
+            sensitive_logs.append(log)
+
+    analysis_results = []
+
+    for user_arn, logs in user_logs.items():
+        if user_arn == "unknown":
+            continue
+        combined_log_text = "\n\n".join([json.dumps(log, indent=4) for log in logs])
+        security_analysis = analyze_log({"log_event": combined_log_text})
+        policy_recommendation = analyze_policy_multiple(logs, user_arn)
         analysis_results.append({
-            "log_event": log,
+            "type": "daily_summary",
             "user_arn": user_arn,
+            "log_count": len(logs),
             "analysis_comment": security_analysis,
             "policy_recommendation": policy_recommendation
         })
+
+    for user_arn, logs in user_logs.items():
+        if user_arn != "unknown" and len(logs) >= min_log_per_user:
+            print(f"Analyzing heavy user: {user_arn}")
+            combined_log_text = "\n\n".join([json.dumps(log, indent=4) for log in logs])
+            security_analysis = analyze_log({"log_event": combined_log_text})
+            policy_recommendation = analyze_policy_multiple(logs, user_arn)
+            analysis_results.append({
+                "type": "heavy_user_analysis",
+                "user_arn": user_arn,
+                "log_count": len(logs),
+                "analysis_comment": security_analysis,
+                "policy_recommendation": policy_recommendation
+            })
+
+    for log in sensitive_logs:
+        user_arn = log.get("userIdentity", {}).get("arn", "unknown")
+        if user_arn == "unknown":
+            continue
+        print(f"Sensitive event detected: {log.get('eventName')} by {user_arn}")
+        security_analysis = analyze_log(log)
+        policy_recommendation = analyze_policy(log, user_arn)
+        analysis_results.append({
+            "type": "sensitive_event",
+            "user_arn": user_arn,
+            "log_event": log,
+            "analysis_comment": security_analysis,
+            "policy_recommendation": policy_recommendation
+        })
+
     save_analysis_to_s3(output_bucket_name, output_file_key, analysis_results)
-    print("AWS log analysis complete.")
+    print("Combined AWS log analysis complete.")
 
 def main():
     aws_bucket_name = "aws-cloudtrail-logs-863518424796-24295883"
     aws_log_prefix = "AWSLogs/"
     output_bucket_name = "aws-cloudtrail-log-comment"
     output_file_key = "aws_result.json"
-    process_aws_logs(aws_bucket_name, aws_log_prefix, output_bucket_name, output_file_key)
+    process_combined_aws_logs(aws_bucket_name, aws_log_prefix, output_bucket_name, output_file_key)
 
 if __name__ == "__main__":
     main()

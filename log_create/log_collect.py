@@ -19,7 +19,7 @@ REGIONS = [
     'us-west-2'
 ]
 
-# 수집 기간 (UTC 기준 ISO 포맷)
+# 수집 기간
 START_DATE = '2025-03-20T00:00:00'
 END_DATE = '2025-03-23T00:00:00'
 OUTPUT_DIR = './cloudtrail_logs_json'

@@ -172,3 +172,4 @@ cython_debug/
 
 flaws_cloudtrail00_split/*
 cloudtrail_logs_json/*
+output/*
