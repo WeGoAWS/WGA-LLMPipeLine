@@ -1,199 +1,234 @@
 import json
 import logging
-from collections import defaultdict
+import re
+import os
 from datetime import datetime
-from typing import Any, Dict, List, Union
+from collections import defaultdict
+from tqdm import tqdm
+
 from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
-from langchain.memory import ConversationBufferMemory
+from langchain_core.prompts import PromptTemplate
 from langchain_ollama import ChatOllama
-from langchain.schema import AIMessage
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
 
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s") 
-memory = ConversationBufferMemory(memory_key="chat_history")
+# LLM 구성
+ollama_model = "deepseek-r1:7b"
+ollama_llm = ChatOllama(model=ollama_model)
 
-daily_user_analysis_prompt = PromptTemplate(
-    input_variables=["log_event", "date", "user"],
-    template="""
-You are a cloud security analyst reviewing AWS CloudTrail logs for user {user} on {date}.
+# 프롬프트 설정
+log_analysis_prompt = PromptTemplate(
+    input_variables=["log_event"],
+    template="""You are a cloud security analyst reviewing AWS CloudTrail logs.
 
-Analyze the following aggregated AWS CloudTrail log events and answer the following questions in detail:
+Analyze the following AWS CloudTrail log event and answer the following questions in detail:
 
-Log Events:
+Log Event:
 {log_event}
 
-1. Is the aggregated activity for user {user} on {date} indicative of any known security risks or misconfigurations?
-2. Classify the overall activity as:
-   - Normal activity
-   - Suspicious activity
-   - Malicious activity
-3. Rate the severity of the risk (None, Low, Medium, High).
-4. Explain why this risk level was assigned based on:
-   - The actions performed
-   - The resources involved
-   - The user identity type (IAM user, role, root)
-   - Whether MFA was used
-   - Source IP or user agent anomalies
-5. Recommend any of the following, if applicable:
-   - IAM permission tightening
-   - Policy change
-   - Monitoring or alerting
-   - No action required
-6. Finally, summarize the aggregated activity in **one short, human-readable sentence**.
+Respond in the following JSON format:
 
-Respond in clearly labeled sections.
+{{ 
+  "assessment": "<Brief analysis>",
+  "classification": "<Normal activity | Suspicious activity | Malicious activity>",
+  "risk_level": "<None | Low | Medium | High>",
+  "justification": "<Why this level was assigned>",
+  "recommendation": "<Action recommendation>",
+  "summary": "<One-sentence summary>"
+}}
+Only respond with a valid JSON object. Do not include any explanation outside the JSON.
 """
 )
 
-daily_user_policy_prompt = PromptTemplate(
-    input_variables=["log_event", "current_permissions", "date", "user"],
+policy_prompt = PromptTemplate(
+    input_variables=["log_event", "current_permissions", "action_context"],
     template="""
-You are a cloud IAM policy expert. Based on the aggregated CloudTrail logs for user {user} on {date} and the user's current IAM permissions, analyze and recommend policy adjustments.
+You are a cloud IAM policy expert. Based on the CloudTrail log, the user's current IAM permissions, and known information about AWS actions, analyze and recommend policy adjustments.
 
-CloudTrail Logs:
+CloudTrail Log:
 {log_event}
 
 Current Permissions:
 {current_permissions}
 
-1. Are there any permissions that were not used in these logs and appear unnecessary?
-2. Are there any actions in the logs that were blocked or would fail due to missing permissions?
-3. Based on the aggregated activity, should any permissions be added or removed?
+Action Context:
+{action_context}
+You must ONLY suggest IAM permission Action strings, such as "s3:ListBucket", ...
+Do NOT include OpenID scopes, resource ARNs, roles, or unrelated strings.
+Respond in the following JSON format:
 
-When modifying permissions:
-- DO NOT remove permissions that were used multiple times across logs.
-- DO NOT remove permissions that might cause service disruption.
-- ONLY add permissions if they are required for observed activity.
 
-Respond in the format below:
+{{
+  "REMOVE": ["permission1", "permission2"],
+  "ADD": ["permission3"],
+  "Reason": "One-line rationale"
+}}
 
-REMOVE: <list of permissions to remove or None>
-ADD: <list of permissions to add or None>
-Reason: <One-line rationale that justifies the change>
+Ensure the response is valid JSON. Do not include any explanation outside the JSON.
 """
 )
 
-# LangChain 실행 파이프라인
-ollama_model = "deepseek-r1:7b"
-ollama_llm = ChatOllama(model=ollama_model)
-daily_user_analysis_chain = daily_user_analysis_prompt | ollama_llm
-daily_user_policy_chain = daily_user_policy_prompt | ollama_llm
+log_analysis_chain = log_analysis_prompt | ollama_llm
+policy_analysis_chain = policy_prompt | ollama_llm
 
-def analyze_daily_user_logs(logs: List[Dict[str, Any]], date: str, user: str) -> str:
-    aggregated_logs = "\n\n".join([json.dumps(log, indent=4) for log in logs])
+# FAISS 벡터 스토어 로딩 및 검색
+def load_action_vectorstore(save_path="faiss_index"):
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return FAISS.load_local(save_path, embeddings, allow_dangerous_deserialization=True)
+
+def get_action_context(query_list, vectorstore, k=3):
+    context_chunks = []
+    for query in query_list:
+        docs = vectorstore.similarity_search(query, k=k)# faiss에서 유사한 문서 검색
+        if docs:
+            context_chunks.append(f"[{query}]\n" + "\n".join([doc.page_content for doc in docs]))
+    return "\n\n".join(context_chunks)
+
+# 로그 분석
+def analyze_log(log, action_vectorstore=None):
     try:
-        logging.info(f"Analyzing logs for user '{user}' on {date} with {len(logs)} events...")
-        response = daily_user_analysis_chain.invoke({
-            "log_event": aggregated_logs,
-            "date": date,
-            "user": user
+        raw_text = json.dumps(log, indent=4)
+        actions = re.findall(r'"eventName"\s*:\s*"(\w+)"', raw_text)# eventName 추출
+        action_context = get_action_context(actions, action_vectorstore) if action_vectorstore else "" 
+
+        response = log_analysis_chain.invoke({
+            "log_event": raw_text + ("\n\n=== Related AWS Action Info ===\n" + action_context if action_context else "")
         })
+
         response_text = response.content if hasattr(response, "content") else str(response)
-        logging.info("Daily-user log analysis complete.")
-        return response_text
+        json_match = re.search(r"```json\s*(\{.*?\})\s*```", response_text, re.DOTALL)
+        if not json_match:
+            json_match = re.search(r"(\{.*\"risk_level\".*\})", response_text, re.DOTALL)
+        if json_match:
+            parsed = json.loads(json_match.group(1))
+            risk_level = parsed.get("risk_level", "Unknown")
+        else:
+            parsed = None
+            risk_level = "Unknown"
     except Exception as e:
-        logging.error(f"Error in daily-user log analysis for user {user} on {date}: {e}")
-        return "Daily-user log analysis failed."
+        response_text = f"Failed to parse response: {e}"
+        risk_level = "Unknown"
 
-def analyze_daily_user_policy(logs: List[Dict[str, Any]], date: str, user: str) -> Dict[str, Union[List[str], str]]:
-    aggregated_logs = "\n\n".join([json.dumps(log, indent=4) for log in logs])
+    return {
+        "comment": response_text,
+        "risk": risk_level
+    }
+
+# 정책 추천
+def analyze_policy_multiple(logs, action_vectorstore=None):
     try:
-        logging.info(f"Analyzing IAM policy for user '{user}' on {date} with {len(logs)} events...")
-        current_permissions: List[str] = []  # 현재 권한(이 코드에서는 일단 빈 리스트.)
-        response = daily_user_policy_chain.invoke({
-            "log_event": aggregated_logs,
+        user_arn = logs[0].get("userIdentity", {}).get("arn", "unknown")
+        current_permissions = []  # 실제 IAM 권한 조회 대신 일단은 빈 리스트
+
+        all_logs_text = "\n\n".join([json.dumps(log, indent=4) for log in logs])
+        actions = list({log.get("eventName", "") for log in logs if log.get("eventName")})# 
+        action_context = get_action_context(actions, action_vectorstore) if action_vectorstore else "" 
+
+        response = policy_analysis_chain.invoke({
+            "log_event": all_logs_text,
             "current_permissions": json.dumps(current_permissions, indent=4),
-            "date": date,
-            "user": user
+            "action_context": action_context
         })
-        response_text = response.content if hasattr(response, "content") else str(response)
-        logging.info("Daily-user IAM policy analysis complete.")
+
+        response_text = response.content
         result = {"REMOVE": [], "ADD": [], "Reason": ""}
-        for line in response_text.strip().split("\n"):
-            if line.startswith("REMOVE:"):
-                perms = line.replace("REMOVE:", "").strip()
-                if perms != "None":
-                    result["REMOVE"].append(perms)
-            elif line.startswith("ADD:"):
-                perms = line.replace("ADD:", "").strip()
-                if perms != "None":
-                    result["ADD"].append(perms)
-            elif line.startswith("Reason:"):
-                result["Reason"] = line.replace("Reason:", "").strip()
+
+        json_match = re.search(r"(\{.*\"Reason\".*\})", response_text, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group(1))
+        else:
+            for line in response_text.strip().split("\n"):
+                if line.startswith("REMOVE:"):
+                    perms = line.replace("REMOVE:", "").strip()
+                    if perms != "None":
+                        result["REMOVE"].append(perms)
+                elif line.startswith("ADD:"):
+                    perms = line.replace("ADD:", "").strip()
+                    if perms != "None":
+                        result["ADD"].append(perms)
+                elif line.startswith("Reason:"):
+                    result["Reason"] = line.replace("Reason:", "").strip()
         return result
     except Exception as e:
-        logging.error(f"Error in IAM policy analysis for user {user} on {date}: {e}")
+        print(f"Error in policy analysis: {e}")
         return {"REMOVE": [], "ADD": [], "Reason": "Policy analysis failed."}
 
-def make_json_serializable(obj: Any) -> Any:# JSON으로 직렬화 가능한 형태로 변환
-    if isinstance(obj, AIMessage):
-        return obj.content
-    elif isinstance(obj, dict):
-        return {key: make_json_serializable(value) for key, value in obj.items()}
-    elif isinstance(obj, list):
-        return [make_json_serializable(item) for item in obj]
-    else:
-        return obj
+# JSON 로그 로딩
+def get_logs(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
-def process_log(local_file: str, output_file: str) -> None:
-    logging.info(f"Loading local logs from {local_file}...")
-    try:
-        with open(local_file, "r") as f:
-            data = json.load(f)
-    except Exception as e:
-        logging.error(f"Failed to load local logs: {e}")
-        return
+# 결과 저장
+def save_analysis(file_path, analysis_results):
+    with open(file_path, 'w') as f:
+        json.dump(analysis_results, f, indent=4)
+    logging.info(f"Local analysis result saved to {file_path}")
 
-    if isinstance(data, list):# 로그 데이터가 리스트 형태로 들어올 경우
-        records = data
-    elif isinstance(data, dict) and "Records" in data: # 로그 데이터가 딕셔너리 형태로 들어올 경우
-        records = data["Records"]
-    else:
-        logging.error("No valid log records found.")
-        return
-
-    day_user_logs: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))# 날짜별, 유저별 로그를 저장할 딕셔너리
-    for log in records:
-        event_time_str = log.get("eventTime", "")
-        user_arn = log.get("userIdentity", {}).get("arn", "unknown")
+# 로그 처리
+def process_logs(local_file_paths, output_file_path, action_vectorstore=None):
+    all_logs = []
+    for file_path in local_file_paths:
         try:
-            event_date = datetime.strptime(event_time_str, "%Y-%m-%dT%H:%M:%SZ").date()
-            day_user_logs[str(event_date)][user_arn].append(log)
+            logs = get_logs(file_path)
         except Exception as e:
-            logging.error(f"Error parsing eventTime '{event_time_str}': {e}")
+            logging.error(f"Error reading {file_path}: {e}")
+            continue
+        records = logs.get("Records", []) if isinstance(logs, dict) else logs
+        all_logs.extend(records)
+
+    logging.info(f"총 수집된 로그 수: {len(all_logs)}")
+
+    user_date_logs = defaultdict(lambda: defaultdict(list))
+    for log in all_logs:
+        user_arn = log.get("userIdentity", {}).get("arn", "unknown")
+        event_date = log.get("eventTime", "")[:10]
+        user_date_logs[user_arn][event_date].append(log)
 
     analysis_results = []
-    for date, user_logs in day_user_logs.items():
-        for user, logs in user_logs.items():
-            if user == "unknown":
-                continue
-            logging.info(f"Processing {len(logs)} log(s) for user '{user}' on {date}")
-            security_analysis = analyze_daily_user_logs(logs, date, user)
-            policy_recommendation = analyze_daily_user_policy(logs, date, user)
+
+    for user_arn, date_logs in tqdm(user_date_logs.items(), desc="사용자별 로그 분석 진행"):
+        if user_arn == "unknown":
+            continue
+        for date_str, logs in tqdm(date_logs.items(), desc=f"{user_arn}의 날짜별 분석", leave=False):
+            logging.info(f"Processing {len(logs)} log(s) for user '{user_arn}' on {date_str}")
+            combined_log_text = "\n\n".join([json.dumps(log, indent=4) for log in logs])
+            security_analysis = analyze_log({"log_event": combined_log_text}, action_vectorstore=action_vectorstore)
+            policy_recommendation = analyze_policy_multiple(logs, action_vectorstore=action_vectorstore)
             analysis_results.append({
-                "date": date,
-                "user": user,
+                "date": date_str,
+                "user": user_arn,
                 "log_count": len(logs),
                 "analysis_timestamp": datetime.utcnow().isoformat() + "Z",
-                "analysis_comment": security_analysis,
+                "analysis_comment": security_analysis["comment"],
+                "risk_level": security_analysis["risk"],
                 "policy_recommendation": policy_recommendation
             })
 
-    analysis_results_serializable = make_json_serializable(analysis_results)
-    
-    try:
-        with open(output_file, "w") as f:
-            json.dump(analysis_results_serializable, f, indent=4)
-        logging.info(f"Day-and-user-based log analysis complete. Results saved to: {output_file}")
-    except Exception as e:
-        logging.error(f"Failed to save analysis results: {e}")
+    if all_logs:
+        logging.info(f"Processing global summary for {len(all_logs)} log(s)...")
+        combined_all_text = "\n\n".join([json.dumps(log, indent=4) for log in all_logs])
+        full_day_summary = analyze_log({"log_event": combined_all_text}, action_vectorstore=action_vectorstore)
+        analysis_results.append({
+            "type": "daily_global_summary",
+            "log_count": len(all_logs),
+            "analysis_timestamp": datetime.utcnow().isoformat() + "Z",
+            "analysis_comment": full_day_summary["comment"],
+            "risk_level": full_day_summary["risk"]
+        })
 
-def main() -> None:
-    num = 3
-    local_file = f"flaws_cloudtrail00_split/part_{num}.json"
-    output_file = f"output/test_{num}.json"
-    process_log(local_file, output_file)
+    save_analysis(output_file_path, analysis_results)
+
+# 실행
+def main():
+    num = 11
+    local_files = [f"flaws_cloudtrail00_split/part_{num}.json"]
+    output_file_path = f"output/analysis_results_{num}.json"
+    logging.info(f"Analyzing local files: {local_files}")
+
+    action_vectorstore = load_action_vectorstore()
+    process_logs(local_files, output_file_path, action_vectorstore=action_vectorstore)
 
 if __name__ == "__main__":
     main()
