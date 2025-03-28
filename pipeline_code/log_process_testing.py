@@ -16,7 +16,11 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 # LLM 구성
 ollama_model = "deepseek-r1:7b"
-ollama_llm = ChatOllama(model=ollama_model)
+ollama_llm = ChatOllama(
+    model="deepseek-r1:7b",
+    base_url="http://100.73.251.76:11434"
+)
+
 
 # 프롬프트 설정
 log_analysis_prompt = PromptTemplate(
@@ -73,11 +77,12 @@ Ensure the response is valid JSON. Do not include any explanation outside the JS
 log_analysis_chain = log_analysis_prompt | ollama_llm
 policy_analysis_chain = policy_prompt | ollama_llm
 
-# FAISS 벡터 스토어 로딩 및 검색
+# FAISS 벡터 
 def load_action_vectorstore(save_path="faiss_index"):
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     return FAISS.load_local(save_path, embeddings, allow_dangerous_deserialization=True)
 
+# 유사문서 검색
 def get_action_context(query_list, vectorstore, k=3):
     context_chunks = []
     for query in query_list:
@@ -86,7 +91,7 @@ def get_action_context(query_list, vectorstore, k=3):
             context_chunks.append(f"[{query}]\n" + "\n".join([doc.page_content for doc in docs]))
     return "\n\n".join(context_chunks)
 
-# 로그 분석
+# 로그분석
 def analyze_log(log, action_vectorstore=None):
     try:
         raw_text = json.dumps(log, indent=4)
@@ -115,16 +120,33 @@ def analyze_log(log, action_vectorstore=None):
         "comment": response_text,
         "risk": risk_level
     }
+    
+def is_valid_policy(json_obj):
+    required_keys = {"REMOVE", "ADD", "Reason"}
+    if not (
+        isinstance(json_obj, dict)
+        and required_keys.issubset(json_obj.keys())
+        and isinstance(json_obj["REMOVE"], list)
+        and isinstance(json_obj["ADD"], list)
+        and isinstance(json_obj["Reason"], str)
+    ):
+        return False
 
-# 정책 추천
-def analyze_policy_multiple(logs, action_vectorstore=None):
+    iam_action_pattern = re.compile(r"^[a-z0-9]+:[A-Z][a-zA-Z0-9]+$") # 패턴 검증
+
+    json_obj["REMOVE"] = [perm for perm in json_obj["REMOVE"] if iam_action_pattern.match(perm)]
+    json_obj["ADD"] = [perm for perm in json_obj["ADD"] if iam_action_pattern.match(perm)]
+
+    return True
+
+def analyze_policy(logs, action_vectorstore=None):
     try:
         user_arn = logs[0].get("userIdentity", {}).get("arn", "unknown")
         current_permissions = []  # 실제 IAM 권한 조회 대신 일단은 빈 리스트
 
         all_logs_text = "\n\n".join([json.dumps(log, indent=4) for log in logs])
-        actions = list({log.get("eventName", "") for log in logs if log.get("eventName")})# 
-        action_context = get_action_context(actions, action_vectorstore) if action_vectorstore else "" 
+        actions = list({log.get("eventName", "") for log in logs if log.get("eventName")})
+        action_context = get_action_context(actions, action_vectorstore) if action_vectorstore else ""
 
         response = policy_analysis_chain.invoke({
             "log_event": all_logs_text,
@@ -132,30 +154,41 @@ def analyze_policy_multiple(logs, action_vectorstore=None):
             "action_context": action_context
         })
 
-        response_text = response.content
+        response_text = response.content if hasattr(response, "content") else str(response)
         result = {"REMOVE": [], "ADD": [], "Reason": ""}
 
         json_match = re.search(r"(\{.*\"Reason\".*\})", response_text, re.DOTALL)
         if json_match:
-            return json.loads(json_match.group(1))
-        else:
-            for line in response_text.strip().split("\n"):
-                if line.startswith("REMOVE:"):
-                    perms = line.replace("REMOVE:", "").strip()
-                    if perms != "None":
-                        result["REMOVE"].append(perms)
-                elif line.startswith("ADD:"):
-                    perms = line.replace("ADD:", "").strip()
-                    if perms != "None":
-                        result["ADD"].append(perms)
-                elif line.startswith("Reason:"):
-                    result["Reason"] = line.replace("Reason:", "").strip()
+            try:
+                parsed = json.loads(json_match.group(1))
+                if is_valid_policy(parsed):  
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+        
+        for line in response_text.strip().split("\n"):
+            if line.startswith("REMOVE:"):
+                perms = line.replace("REMOVE:", "").strip()
+                if perms != "None":
+                    result["REMOVE"].append(perms)
+            elif line.startswith("ADD:"):
+                perms = line.replace("ADD:", "").strip()
+                if perms != "None":
+                    result["ADD"].append(perms)
+            elif line.startswith("Reason:"):
+                result["Reason"] = line.replace("Reason:", "").strip()
+
+        
+        is_valid_policy(result)  
         return result
+
     except Exception as e:
         print(f"Error in policy analysis: {e}")
         return {"REMOVE": [], "ADD": [], "Reason": "Policy analysis failed."}
 
-# JSON 로그 로딩
+
+# 로그 읽어오기
 def get_logs(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
         return json.load(f)
@@ -195,7 +228,7 @@ def process_logs(local_file_paths, output_file_path, action_vectorstore=None):
             logging.info(f"Processing {len(logs)} log(s) for user '{user_arn}' on {date_str}")
             combined_log_text = "\n\n".join([json.dumps(log, indent=4) for log in logs])
             security_analysis = analyze_log({"log_event": combined_log_text}, action_vectorstore=action_vectorstore)
-            policy_recommendation = analyze_policy_multiple(logs, action_vectorstore=action_vectorstore)
+            policy_recommendation = analyze_policy(logs, action_vectorstore=action_vectorstore)
             analysis_results.append({
                 "date": date_str,
                 "user": user_arn,

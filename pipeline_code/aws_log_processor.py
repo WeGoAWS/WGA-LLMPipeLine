@@ -71,17 +71,20 @@ Ensure the response is valid JSON. Do not include any explanation outside the JS
 """
 )
 
-# LangChain 실행 파이프라인 구성  
+# 모델 설정
 ollama_model = "deepseek-r1:7b"
-ollama_llm = ChatOllama(model=ollama_model)
+ollama_llm = ChatOllama(
+    model="deepseek-r1:7b",
+    base_url="http://100.73.251.76:11434"
+)
 log_analysis_chain = log_analysis_prompt | ollama_llm
 policy_analysis_chain = policy_prompt | ollama_llm
-# 민감한 이벤트 목록
+
+# 민감한 이벤트 목록이랑 함수
 SENSITIVE_EVENTS = {
     "ConsoleLogin", "PutUserPolicy", "AttachUserPolicy",
     "CreateAccessKey", "UpdateAssumeRolePolicy"
 }
-
 def is_sensitive_event(event_name):
     return event_name in SENSITIVE_EVENTS
 
