@@ -97,11 +97,16 @@ def load_action_vectorstore(s3_bucket="wga-faiss-index", s3_prefix="faiss_index"
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     return FAISS.load_local(local_dir, embeddings, allow_dangerous_deserialization=True)
 
-
-def yesterday_s3(s3_bucket):
+def parsing_key(s3_bucket: str, region: str = "us-east-1") -> list[str]:
     s3 = boto3.client("s3")
+    sts = boto3.client("sts")
+
+    # 계정 ID 자동 조회
+    account_id = sts.get_caller_identity()["Account"]
+
+    # 어제 날짜 계산
     yesterday = datetime.utcnow().date() - timedelta(days=1)
-    prefix = f"{yesterday.strftime('%Y/%m/%d')}/"  
+    prefix = f"AWSLogs/{account_id}/CloudTrail/{region}/{yesterday.strftime('%Y/%m/%d')}/"
 
     logging.info(f"Listing S3 keys under prefix: {prefix}")
     s3_keys = []
@@ -113,6 +118,7 @@ def yesterday_s3(s3_bucket):
 
     logging.info(f"Found {len(s3_keys)} log files for {yesterday}")
     return s3_keys
+
 # 유사 문서 검색
 def get_action_context(query_list, vectorstore, k=3):
     context_chunks = []
@@ -239,7 +245,7 @@ def upload_analysis(bucket_name, object_key, analysis_results):
 def process_logs(s3_buckets, output_bucket, output_key, action_vectorstore=None):
     all_logs = []
     for s3_bucket in s3_buckets:
-        s3_keys = yesterday_s3(s3_bucket)
+        s3_keys = parsing_key(s3_bucket)
         for s3_key in s3_keys:
             local_file_path = f"/tmp/{os.path.basename(s3_key)}"
             download_logs(s3_bucket, s3_key, local_file_path)
@@ -293,7 +299,7 @@ def process_logs(s3_buckets, output_bucket, output_key, action_vectorstore=None)
 # 실행
 def main():
     s3_bucket = []  
-    s3_keys = yesterday_s3(s3_bucket) 
+    s3_keys = parsing_key(s3_bucket) 
     output_bucket = "wga-outputbucket"  
     output_key = f"results/{(datetime.utcnow().date() - timedelta(days=1)).isoformat()}-analysis.json"
     logging.info(f"Analyzing S3 files: {s3_keys} from {s3_bucket}")
