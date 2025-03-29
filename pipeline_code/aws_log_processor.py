@@ -7,13 +7,13 @@ from collections import defaultdict
 from tqdm import tqdm
 import boto3
 from botocore.exceptions import ClientError
-
 from langchain.chains import LLMChain
 from langchain_core.prompts import PromptTemplate
 from langchain_ollama import ChatOllama
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-
+import shutil
+from datetime import datetime, timedelta
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 # LLM 구성
@@ -78,10 +78,41 @@ log_analysis_chain = log_analysis_prompt | ollama_llm
 policy_analysis_chain = policy_prompt | ollama_llm
 
 # FAISS 벡터스토어 로드
-def load_action_vectorstore(save_path="faiss_index"):
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    return FAISS.load_local(save_path, embeddings, allow_dangerous_deserialization=True)
+def load_action_vectorstore(s3_bucket="wga-faiss-index", s3_prefix="faiss_index", local_dir="/tmp/faiss_index"):
+    s3 = boto3.client("s3")
+    if os.path.exists(local_dir):
+        shutil.rmtree(local_dir)
+    os.makedirs(local_dir, exist_ok=True)
 
+    response = s3.list_objects_v2(Bucket=s3_bucket, Prefix=s3_prefix)
+    for obj in response.get("Contents", []):
+        key = obj["Key"]
+        filename = os.path.basename(key)
+        if not filename:
+            continue
+        local_path = os.path.join(local_dir, filename)
+        s3.download_file(s3_bucket, key, local_path)
+        logging.info(f"Downloaded FAISS index file {key} to {local_path}")
+
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return FAISS.load_local(local_dir, embeddings, allow_dangerous_deserialization=True)
+
+
+def yesterday_s3(s3_bucket):
+    s3 = boto3.client("s3")
+    yesterday = datetime.utcnow().date() - timedelta(days=1)
+    prefix = f"{yesterday.strftime('%Y/%m/%d')}/"  # 예: "2025/03/28/"
+
+    logging.info(f"Listing S3 keys under prefix: {prefix}")
+    s3_keys = []
+
+    paginator = s3.get_paginator('list_objects_v2')
+    for page in paginator.paginate(Bucket=s3_bucket, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            s3_keys.append(obj['Key'])
+
+    logging.info(f"Found {len(s3_keys)} log files for {yesterday}")
+    return s3_keys
 # 유사 문서 검색
 def get_action_context(query_list, vectorstore, k=3):
     context_chunks = []
@@ -204,21 +235,30 @@ def upload_analysis(bucket_name, object_key, analysis_results):
     except ClientError as e:
         logging.error(f"Error uploading to {bucket_name}/{object_key}: {e}")
         raise
-
-# 로그 처리
-def process_logs(s3_bucket, s3_keys, output_bucket, output_key, action_vectorstore=None):
+    
+def process_logs(s3_buckets, output_bucket, output_key, action_vectorstore=None):
     all_logs = []
-    for s3_key in s3_keys:
-        local_file_path = f"/tmp/{os.path.basename(s3_key)}"
-        download_logs(s3_bucket, s3_key, local_file_path)
-        try:
-            with open(local_file_path, 'r', encoding='utf-8') as f:
-                logs = json.load(f)
-        except Exception as e:
-            logging.error(f"Error reading {local_file_path}: {e}")
-            continue
-        records = logs.get("Records", []) if isinstance(logs, dict) else logs
-        all_logs.extend(records)
+    yesterday = datetime.utcnow().date() - timedelta(days=1)
+
+    for s3_bucket in s3_buckets:
+        logging.info(f"Collecting logs from bucket: {s3_bucket}")
+        s3 = boto3.client("s3")
+        prefix = f"{yesterday.strftime('%Y/%m/%d')}/"
+
+        paginator = s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=s3_bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                local_file_path = f"/tmp/{os.path.basename(key)}"
+                try:
+                    download_logs(s3_bucket, key, local_file_path)
+                    with open(local_file_path, 'r', encoding='utf-8') as f:
+                        logs = json.load(f)
+                        records = logs.get("Records", []) if isinstance(logs, dict) else logs
+                        all_logs.extend(records)
+                except Exception as e:
+                    logging.error(f"Failed to process {key} from {s3_bucket}: {e}")
+                    continue
 
     logging.info(f"총 수집된 로그 수: {len(all_logs)}")
 
@@ -264,10 +304,10 @@ def process_logs(s3_bucket, s3_keys, output_bucket, output_key, action_vectorsto
 
 # 실행
 def main():
-    s3_bucket = ""  
-    s3_keys = ""  
-    output_bucket = ""  
-    output_key = ""  
+    s3_bucket = []  
+    s3_keys = yesterday_s3(s3_bucket) 
+    output_bucket = "wga-outputbucket"  
+    output_key = f"results/{(datetime.utcnow().date() - timedelta(days=1)).isoformat()}-analysis.json"
     logging.info(f"Analyzing S3 files: {s3_keys} from {s3_bucket}")
 
     action_vectorstore = load_action_vectorstore()
