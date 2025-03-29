@@ -101,7 +101,6 @@ def parsing_key(s3_bucket: str, region: str = "us-east-1") -> list[str]:
     s3 = boto3.client("s3")
     sts = boto3.client("sts")
 
-    # 계정 ID 자동 조회
     account_id = sts.get_caller_identity()["Account"]
 
     # 어제 날짜 계산
@@ -305,7 +304,7 @@ def main():
     logging.info(f"Analyzing S3 files: {s3_keys} from {s3_bucket}")
 
     action_vectorstore = load_action_vectorstore()
-    process_logs(s3_bucket, s3_keys, output_bucket, output_key, action_vectorstore=action_vectorstore)
+    process_logs(s3_bucket, output_bucket, output_key, action_vectorstore=action_vectorstore)
 
 if __name__ == "__main__":
     main()
