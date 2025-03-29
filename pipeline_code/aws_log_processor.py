@@ -101,7 +101,7 @@ def load_action_vectorstore(s3_bucket="wga-faiss-index", s3_prefix="faiss_index"
 def yesterday_s3(s3_bucket):
     s3 = boto3.client("s3")
     yesterday = datetime.utcnow().date() - timedelta(days=1)
-    prefix = f"{yesterday.strftime('%Y/%m/%d')}/"  # 예: "2025/03/28/"
+    prefix = f"{yesterday.strftime('%Y/%m/%d')}/"  
 
     logging.info(f"Listing S3 keys under prefix: {prefix}")
     s3_keys = []
@@ -238,29 +238,17 @@ def upload_analysis(bucket_name, object_key, analysis_results):
     
 def process_logs(s3_buckets, output_bucket, output_key, action_vectorstore=None):
     all_logs = []
-    yesterday = datetime.utcnow().date() - timedelta(days=1)
-
     for s3_bucket in s3_buckets:
-        logging.info(f"Collecting logs from bucket: {s3_bucket}")
-        s3 = boto3.client("s3")
-        prefix = f"{yesterday.strftime('%Y/%m/%d')}/"
+        s3_keys = yesterday_s3(s3_bucket)
+        for s3_key in s3_keys:
+            local_file_path = f"/tmp/{os.path.basename(s3_key)}"
+            download_logs(s3_bucket, s3_key, local_file_path)
+            with open(local_file_path, 'r', encoding='utf-8') as f:
+                logs = json.load(f)
+                all_logs.extend(logs)
+            os.remove(local_file_path)  
+    logging.info(f"총 로그 수: {len(all_logs)}")
 
-        paginator = s3.get_paginator('list_objects_v2')
-        for page in paginator.paginate(Bucket=s3_bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                local_file_path = f"/tmp/{os.path.basename(key)}"
-                try:
-                    download_logs(s3_bucket, key, local_file_path)
-                    with open(local_file_path, 'r', encoding='utf-8') as f:
-                        logs = json.load(f)
-                        records = logs.get("Records", []) if isinstance(logs, dict) else logs
-                        all_logs.extend(records)
-                except Exception as e:
-                    logging.error(f"Failed to process {key} from {s3_bucket}: {e}")
-                    continue
-
-    logging.info(f"총 수집된 로그 수: {len(all_logs)}")
 
     user_date_logs = defaultdict(lambda: defaultdict(list))
     for log in all_logs:
